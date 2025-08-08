@@ -10,3 +10,6 @@ python-docx
 pypdf2
 langchain
 aiohttp
+motor
+openai
+chromadb
