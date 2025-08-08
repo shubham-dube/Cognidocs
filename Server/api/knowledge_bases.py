@@ -11,14 +11,7 @@ import aiofiles
 from core.db import get_db
 from core.config import settings
 
-# Import your ingestion starter function (implement in app/services/ingestion.py)
-# It should accept: kb_id (str), list of file paths, and optional metadata
-try:
-    from services.ingestion import start_ingestion_task
-except Exception:  # placeholder if missing during incremental dev
-    async def start_ingestion_task(*args, **kwargs):
-        # fallback noop for early frontend integration
-        return
+from services.ingestion import run_ingestion_task  
 
 router = APIRouter()
 
@@ -118,10 +111,9 @@ async def upload_documents(
         update_doc["description"] = description
     await db.kbs.update_one({"_id": ObjectId(kb_id)}, {"$set": update_doc})
 
-    # Trigger background ingestion
-    # start_ingestion_task should be async; FastAPI BackgroundTasks will call sync function.
-    # To support async ingestion function, wrap it in an asyncio task within a small wrapper in ingestion module.
-    background_tasks.add_task(start_ingestion_task, kb_id, saved_paths)
+    # Trigger background ingestion using the SYNC wrapper
+    # This is the key fix - use run_ingestion_task (sync) instead of start_ingestion_task (async)
+    background_tasks.add_task(run_ingestion_task, kb_id, saved_paths)
 
     return JSONResponse(
         status_code=status.HTTP_202_ACCEPTED,
