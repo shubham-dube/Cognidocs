@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+pydantic
+pymongo
+python-dotenv
+sentence-transformers
+faiss-cpu
+pypdf2
+python-docx
+textract
+langchain
+numpy
