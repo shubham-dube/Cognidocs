@@ -14,3 +14,4 @@ google-generativeai
 aiofiles
 python-multipart
 chardet
+anthropic

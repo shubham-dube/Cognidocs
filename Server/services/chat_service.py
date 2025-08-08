@@ -5,9 +5,11 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime
 from bson import ObjectId
 from pydantic import BaseModel
+import re
 
 import google.generativeai as genai
 from pinecone import Pinecone
+import anthropic
 
 from core.config import settings
 from core.db import get_db
@@ -18,16 +20,29 @@ logger = logging.getLogger(__name__)
 pc = Pinecone(api_key=settings.PINECONE_API_KEY)
 pc_index = pc.Index(settings.PINECONE_INDEX_NAME)
 genai.configure(api_key=settings.GEMINI_API_KEY)
+anthropic_client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+
+# Available models
+AVAILABLE_MODELS = {
+    "gemini-1.5-flash": "gemini",
+    "gemini-1.5-pro": "gemini", 
+    "claude-opus-4-1-20250805": "claude",
+    "claude-opus-4-20250514": "claude",
+    "claude-sonnet-4-20250514": "claude",
+    "claude-3-7-sonnet-20250219": "claude",
+    "claude-3-5-sonnet-20241022": "claude",
+    "claude-3-5-haiku-20241022": "claude",
+    "claude-3-haiku-20240307": "claude"
+}
+DEFAULT_MODEL = "gemini-1.5-flash"
 
 # ---------- Request/Response Models ----------
 class QueryRequest(BaseModel):
     kb_id: str
     kb_name: str
     query: str
-    chat_id: Optional[str] = None
-    chat_title: Optional[str] = None
-    model: str = "gemini-1.5-flash"
-    max_results: int = 5
+    model: str = DEFAULT_MODEL
+    max_results: int = 10
     temperature: float = 0.7
 
 class SourceDocument(BaseModel):
@@ -36,20 +51,41 @@ class SourceDocument(BaseModel):
     chunk_index: int
     relevance_score: float
 
-class QueryResponse(BaseModel):
-    chat_id: str
+class ChatMessage(BaseModel):
     message_id: str
-    query: str
-    response: str
+    kb_id: str
+    created_at: datetime
+    message: str
+    by: str  # "user" or "ai"
+    model_used: Optional[str] = None
+    sources: Optional[List[SourceDocument]] = None
+
+class QueryResponse(BaseModel):
+    message_id: str
+    kb_id: str
+    created_at: datetime
+    message: str
+    by: str
     model_used: str
     sources: List[SourceDocument]
-    timestamp: datetime
     processing_time_ms: int
 
 # ---------- Chat Service Class ----------
 class ChatService:
     def __init__(self):
         self.db = get_db()
+    
+    def clean_text(self, text: str) -> str:
+        """Clean and format text for better display."""
+        if not text:
+            return ""
+        
+        # Remove excessive whitespace and newlines
+        cleaned = re.sub(r'\n\s*\n', '\n\n', text)
+        cleaned = re.sub(r'\s+', ' ', cleaned)
+        cleaned = cleaned.strip()
+        
+        return cleaned
     
     async def generate_query_embedding(self, query: str) -> List[float]:
         """Generate embedding for the user's query."""
@@ -59,7 +95,7 @@ class ChatService:
             resp = genai.embed_content(
                 model=settings.GEMINI_EMBED_MODEL,
                 content=query,
-                task_type="retrieval_query"  # Different task type for queries
+                task_type="retrieval_query"
             )
             
             embedding = resp["embedding"]
@@ -70,7 +106,7 @@ class ChatService:
             logger.error(f"Failed to generate query embedding: {e}")
             raise RuntimeError(f"Failed to generate query embedding: {e}")
     
-    async def search_similar_documents(self, kb_id: str, query_embedding: List[float], max_results: int = 5) -> List[Dict[str, Any]]:
+    async def search_similar_documents(self, kb_id: str, query_embedding: List[float], max_results: int = 10) -> List[Dict[str, Any]]:
         """Search for similar documents in Pinecone vector database."""
         try:
             logger.info(f"Searching for similar documents in KB {kb_id}")
@@ -79,22 +115,26 @@ class ChatService:
             search_results = pc_index.query(
                 vector=query_embedding,
                 top_k=max_results,
-                filter={"kb_id": {"$eq": kb_id}},  # Only search within this KB
+                filter={"kb_id": {"$eq": kb_id}},
                 include_metadata=True
             )
             
+            # Filter results by relevance threshold
+            relevance_threshold = 0.1  # Adjust as needed
             documents = []
-            for match in search_results.matches:
-                doc_data = {
-                    "text": match.metadata.get("text", ""),
-                    "source_file": match.metadata.get("source_file", "unknown"),
-                    "chunk_index": match.metadata.get("chunk_index", 0),
-                    "relevance_score": float(match.score),
-                    "metadata": match.metadata
-                }
-                documents.append(doc_data)
             
-            logger.info(f"Found {len(documents)} similar documents")
+            for match in search_results.matches:
+                if match.score >= relevance_threshold:
+                    doc_data = {
+                        "text": self.clean_text(match.metadata.get("text", "")),
+                        "source_file": match.metadata.get("source_file", "unknown"),
+                        "chunk_index": match.metadata.get("chunk_index", 0),
+                        "relevance_score": float(match.score),
+                        "metadata": match.metadata
+                    }
+                    documents.append(doc_data)
+            
+            logger.info(f"Found {len(documents)} relevant documents above threshold")
             return documents
             
         except Exception as e:
@@ -110,20 +150,18 @@ class ChatService:
         current_length = 0
         
         for i, doc in enumerate(documents, 1):
-            doc_text = doc["text"].strip()
+            doc_text = doc["text"]
             source_file = doc["source_file"]
             relevance = doc["relevance_score"]
             
-            # Format document with metadata
             doc_section = f"""
 Document {i} (Source: {source_file}, Relevance: {relevance:.3f}):
 {doc_text}
 ---
 """
             
-            # Check if adding this document would exceed length limit
             if current_length + len(doc_section) > max_context_length:
-                if i == 1:  # If even first document is too long, truncate it
+                if i == 1:
                     truncated = doc_text[:max_context_length - 200] + "...(truncated)"
                     doc_section = f"""
 Document 1 (Source: {source_file}, Relevance: {relevance:.3f}):
@@ -138,20 +176,17 @@ Document 1 (Source: {source_file}, Relevance: {relevance:.3f}):
         
         return "\n".join(context_parts)
     
-    async def generate_response(self, query: str, context: str, kb_name: str, model: str, temperature: float, chat_history: List[Dict] = None) -> str:
-        """Generate AI response using Gemini with the provided context."""
+    async def generate_gemini_response(self, query: str, context: str, kb_name: str, model: str, temperature: float, chat_history: List[ChatMessage] = None) -> str:
+        """Generate response using Gemini models."""
         try:
-            logger.info(f"Generating response using model: {model}")
-            
-            # Build conversation history for context
+            # Build conversation context
             conversation_context = ""
             if chat_history:
                 recent_history = chat_history[-6:]  # Last 3 exchanges
                 for msg in recent_history:
-                    role = "Human" if msg["role"] == "user" else "Assistant"
-                    conversation_context += f"{role}: {msg['content']}\n\n"
+                    role = "Human" if msg.by == "user" else "Assistant"
+                    conversation_context += f"{role}: {msg.message}\n\n"
             
-            # Create prompt with system instructions
             system_prompt = f"""You are an AI assistant helping users query the "{kb_name}" knowledge base.
 
 INSTRUCTIONS:
@@ -169,7 +204,6 @@ CONTEXT DOCUMENTS:
 
 Please provide a comprehensive answer based on the context documents above."""
             
-            # Initialize the model
             model_instance = genai.GenerativeModel(
                 model_name=model,
                 generation_config=genai.types.GenerationConfig(
@@ -180,108 +214,127 @@ Please provide a comprehensive answer based on the context documents above."""
                 )
             )
             
-            # Generate response
             response = model_instance.generate_content(system_prompt)
-            answer = response.text
-            
-            if not answer or answer.strip() == "":
-                answer = "I apologize, but I couldn't generate a proper response. Please try rephrasing your question."
-            
-            logger.info(f"Generated response of length: {len(answer)}")
-            return answer.strip()
+            return response.text.strip() if response.text else "I couldn't generate a proper response. Please try again."
             
         except Exception as e:
-            logger.error(f"Failed to generate AI response: {e}")
-            return f"I encountered an error while generating the response. Please try again later. Error: {str(e)}"
+            logger.error(f"Failed to generate Gemini response: {e}")
+            return f"Error generating response with {model}: {str(e)}"
     
-    async def get_or_create_chat(self, kb_id: str, kb_name: str, chat_id: Optional[str] = None, chat_title: Optional[str] = None) -> str:
-        """Get existing chat or create a new one."""
+    async def generate_claude_response(self, query: str, context: str, kb_name: str, model: str, temperature: float, chat_history: List[ChatMessage] = None) -> str:
+        """Generate response using Claude models."""
         try:
-            if chat_id:
-                # Verify existing chat
-                existing_chat = await self.db.chats.find_one({
-                    "_id": ObjectId(chat_id),
-                    "kb_id": kb_id
-                })
-                if existing_chat:
-                    logger.info(f"Using existing chat: {chat_id}")
-                    return chat_id
-                else:
-                    logger.warning(f"Chat {chat_id} not found, creating new chat")
+            # Build conversation context
+            messages = []
+            if chat_history:
+                recent_history = chat_history[-6:]  # Last 3 exchanges
+                for msg in recent_history:
+                    role = "user" if msg.by == "user" else "assistant"
+                    messages.append({"role": role, "content": msg.message})
             
-            # Create new chat
-            now = datetime.utcnow()
-            chat_doc = {
-                "kb_id": kb_id,
-                "kb_name": kb_name,
-                "title": chat_title,
-                "created_at": now,
-                "last_updated": now,
-                "messages": []
-            }
+            # Add current query
+            messages.append({"role": "user", "content": query})
             
-            result = await self.db.chats.insert_one(chat_doc)
-            new_chat_id = str(result.inserted_id)
-            logger.info(f"Created new chat: {new_chat_id}")
-            return new_chat_id
+            system_prompt = f"""You are an AI assistant helping users query the "{kb_name}" knowledge base.
+
+INSTRUCTIONS:
+1. Answer the user's question based on the provided context documents
+2. Be accurate, helpful, and concise
+3. If the context doesn't contain relevant information, say so clearly
+4. Cite specific sources when making claims
+5. If you're unsure about something, express that uncertainty
+
+CONTEXT DOCUMENTS:
+{context}
+
+Please provide a comprehensive answer based on the context documents above."""
+            
+            response = anthropic_client.messages.create(
+                model=model,
+                max_tokens=2000,
+                temperature=temperature,
+                system=system_prompt,
+                messages=messages
+            )
+            
+            return response.content[0].text.strip() if response.content else "I couldn't generate a proper response. Please try again."
             
         except Exception as e:
-            logger.error(f"Failed to get or create chat: {e}")
-            raise RuntimeError(f"Failed to get or create chat: {e}")
+            logger.error(f"Failed to generate Claude response: {e}")
+            return f"Error generating response with {model}: {str(e)}"
     
-    async def get_chat_history(self, chat_id: str) -> List[Dict]:
-        """Get chat message history."""
+    async def generate_response(self, query: str, context: str, kb_name: str, model: str, temperature: float, chat_history: List[ChatMessage] = None) -> str:
+        """Generate AI response using the specified model."""
         try:
-            chat = await self.db.chats.find_one({"_id": ObjectId(chat_id)})
-            if chat:
-                return chat.get("messages", [])
-            return []
+            if model not in AVAILABLE_MODELS:
+                logger.warning(f"Unknown model {model}, using default {DEFAULT_MODEL}")
+                model = DEFAULT_MODEL
+            
+            model_type = AVAILABLE_MODELS[model]
+            
+            if model_type == "gemini":
+                return await self.generate_gemini_response(query, context, kb_name, model, temperature, chat_history)
+            elif model_type == "claude":
+                return await self.generate_claude_response(query, context, kb_name, model, temperature, chat_history)
+            else:
+                raise ValueError(f"Unsupported model type: {model_type}")
+                
+        except Exception as e:
+            logger.error(f"Failed to generate response: {e}")
+            return f"I encountered an error while generating the response: {str(e)}"
+    
+    async def get_chat_history(self, kb_id: str, limit: int = 20) -> List[ChatMessage]:
+        """Get recent chat history for a knowledge base."""
+        try:
+            cursor = self.db.chat_messages.find(
+                {"kb_id": kb_id}
+            ).sort("created_at", -1).limit(limit)
+            
+            messages = []
+            async for msg in cursor:
+                sources = None
+                if msg.get("sources"):
+                    sources = [
+                        SourceDocument(**source) for source in msg["sources"]
+                    ]
+                
+                messages.append(ChatMessage(
+                    message_id=str(msg["_id"]),
+                    kb_id=msg["kb_id"],
+                    created_at=msg["created_at"],
+                    message=msg["message"],
+                    by=msg["by"],
+                    model_used=msg.get("model_used"),
+                    sources=sources
+                ))
+            
+            return list(reversed(messages))  # Return in chronological order
+            
         except Exception as e:
             logger.error(f"Failed to get chat history: {e}")
             return []
     
-    async def save_message_to_chat(self, chat_id: str, role: str, content: str, model_used: Optional[str] = None, sources: Optional[List[Dict]] = None):
-        """Save a message to the chat history."""
+    async def save_message(self, kb_id: str, message: str, by: str, model_used: Optional[str] = None, sources: Optional[List[Dict]] = None) -> str:
+        """Save a chat message to the database."""
         try:
-            message = {
-                "message_id": str(uuid.uuid4()),
-                "role": role,  # 'user' or 'assistant'
-                "content": content,
-                "timestamp": datetime.utcnow(),
+            message_doc = {
+                "kb_id": kb_id,
+                "created_at": datetime.utcnow(),
+                "message": message,
+                "by": by,
                 "model_used": model_used,
                 "sources": sources or []
             }
             
-            await self.db.chats.update_one(
-                {"_id": ObjectId(chat_id)},
-                {
-                    "$push": {"messages": message},
-                    "$set": {"last_updated": datetime.utcnow()}
-                }
-            )
+            result = await self.db.chat_messages.insert_one(message_doc)
+            message_id = str(result.inserted_id)
             
-            logger.info(f"Saved {role} message to chat {chat_id}")
-            return message["message_id"]
+            logger.info(f"Saved {by} message for KB {kb_id}")
+            return message_id
             
         except Exception as e:
-            logger.error(f"Failed to save message to chat: {e}")
-            raise RuntimeError(f"Failed to save message to chat: {e}")
-    
-    async def auto_generate_chat_title(self, query: str, response: str) -> str:
-        """Auto-generate a concise title for the chat based on the first query."""
-        try:
-            # Simple heuristic title generation
-            query_words = query.strip().split()
-            if len(query_words) <= 6:
-                return query.strip()[:50]
-            
-            # Extract key terms (simple approach)
-            title = " ".join(query_words[:6]) + "..."
-            return title[:50]
-            
-        except Exception as e:
-            logger.warning(f"Failed to auto-generate title: {e}")
-            return "New Chat"
+            logger.error(f"Failed to save message: {e}")
+            raise RuntimeError(f"Failed to save message: {e}")
     
     async def query_and_respond(self, request: QueryRequest) -> QueryResponse:
         """Main method to handle query, search, and response generation."""
@@ -290,19 +343,11 @@ Please provide a comprehensive answer based on the context documents above."""
         try:
             logger.info(f"Processing query for KB {request.kb_id}: {request.query[:100]}...")
             
-            # Get or create chat
-            chat_id = await self.get_or_create_chat(
-                request.kb_id, 
-                request.kb_name, 
-                request.chat_id, 
-                request.chat_title
-            )
-            
             # Get chat history for context
-            chat_history = await self.get_chat_history(chat_id)
+            chat_history = await self.get_chat_history(request.kb_id)
             
             # Save user message
-            user_message_id = await self.save_message_to_chat(chat_id, "user", request.query)
+            user_message_id = await self.save_message(request.kb_id, request.query, "user")
             
             # Generate query embedding
             query_embedding = await self.generate_query_embedding(request.query)
@@ -330,7 +375,7 @@ Please provide a comprehensive answer based on the context documents above."""
             # Prepare source documents for response
             sources = [
                 SourceDocument(
-                    text=doc["text"][:500] + "..." if len(doc["text"]) > 500 else doc["text"],
+                    text=doc["text"],
                     source_file=doc["source_file"],
                     chunk_index=doc["chunk_index"],
                     relevance_score=doc["relevance_score"]
@@ -339,21 +384,13 @@ Please provide a comprehensive answer based on the context documents above."""
             ]
             
             # Save AI response with sources
-            await self.save_message_to_chat(
-                chat_id, 
-                "assistant", 
+            ai_message_id = await self.save_message(
+                request.kb_id, 
                 ai_response,
+                "ai",
                 model_used=request.model,
                 sources=[source.dict() for source in sources]
             )
-            
-            # Auto-generate title for new chats
-            if not request.chat_id and not request.chat_title and len(chat_history) == 0:
-                auto_title = await self.auto_generate_chat_title(request.query, ai_response)
-                await self.db.chats.update_one(
-                    {"_id": ObjectId(chat_id)},
-                    {"$set": {"title": auto_title}}
-                )
             
             # Calculate processing time
             end_time = datetime.utcnow()
@@ -362,28 +399,31 @@ Please provide a comprehensive answer based on the context documents above."""
             logger.info(f"Query processed successfully in {processing_time}ms")
             
             return QueryResponse(
-                chat_id=chat_id,
-                message_id=str(uuid.uuid4()),
-                query=request.query,
-                response=ai_response,
+                message_id=ai_message_id,
+                kb_id=request.kb_id,
+                created_at=end_time,
+                message=ai_response,
+                by="ai",
                 model_used=request.model,
                 sources=sources,
-                timestamp=end_time,
                 processing_time_ms=processing_time
             )
             
         except Exception as e:
             logger.error(f"Failed to process query: {e}")
             
-            # Try to save error message to chat if chat exists
-            if 'chat_id' in locals():
-                try:
-                    await self.save_message_to_chat(
-                        chat_id, 
-                        "assistant", 
-                        f"I apologize, but I encountered an error while processing your query: {str(e)}"
-                    )
-                except:
-                    pass
+            # Save error message
+            error_message = f"I apologize, but I encountered an error while processing your query: {str(e)}"
+            try:
+                await self.save_message(request.kb_id, error_message, "ai", model_used=request.model)
+            except:
+                pass
             
             raise RuntimeError(f"Failed to process query: {e}")
+
+    async def get_available_models(self) -> Dict[str, List[str]]:
+        """Get list of available models grouped by provider."""
+        return {
+            "gemini": [model for model, provider in AVAILABLE_MODELS.items() if provider == "gemini"],
+            "claude": [model for model, provider in AVAILABLE_MODELS.items() if provider == "claude"]
+        }

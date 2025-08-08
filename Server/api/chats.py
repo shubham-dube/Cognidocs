@@ -2,150 +2,196 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Set
 from bson import ObjectId
 from datetime import datetime
-import uuid
 import logging
 
 from core.db import get_db
 from core.config import settings
-from services.chat_service import ChatService, QueryRequest, QueryResponse
+from services.chat_service import ChatService, QueryRequest, QueryResponse, ChatMessage, SourceDocument
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-# ---------- Utilities ----------
-def oid_to_str(o: ObjectId) -> str:
-    return str(o)
-
 # ---------- Pydantic Schemas ----------
-class MessageResponse(BaseModel):
+class ChatMessageResponse(BaseModel):
     message_id: str
-    role: str = Field(..., description="'user' or 'assistant'")
-    content: str
-    timestamp: datetime
-    model_used: Optional[str] = Field(None, description="Model used for assistant responses")
-    sources: Optional[List[Dict[str, Any]]] = Field(None, description="Source documents for assistant responses")
-
-class ChatResponse(BaseModel):
-    chat_id: str
-    kb_id: str
-    kb_name: str
-    title: Optional[str] = None
     created_at: datetime
-    last_updated: datetime
-    message_count: int
-    last_message_preview: Optional[str] = None
+    message: str
+    by: str  # "user" or "ai"
+    model_used: Optional[str] = None
+    sources: Optional[List[SourceDocument]] = None
+    unique_files_referenced: Optional[List[str]] = None  # Unique source files for this message
 
-class ChatDetailResponse(BaseModel):
-    chat_id: str
+class KBChatResponse(BaseModel):
     kb_id: str
-    kb_name: str
-    title: Optional[str] = None
-    created_at: datetime
-    last_updated: datetime
-    messages: List[MessageResponse]
+    messages: List[ChatMessageResponse]
+    total_messages: int
+    unique_files_referenced: Set[str]  # All unique files referenced in this KB's chats
+    models_used: Set[str]  # All models used in this KB's chats
 
-class KBWithChatsResponse(BaseModel):
+class KBWithRecentChatResponse(BaseModel):
     kb_id: str
     kb_name: str
     kb_type: str
     kb_description: Optional[str] = None
     created_at: datetime
-    chat_count: int
-    recent_chats: List[ChatResponse]
+    last_updated: datetime
+    status: str
+    processing_info: Optional[Dict[str, Any]] = None
+    total_messages: int
+    recent_chat: Optional[ChatMessageResponse] = None
+    unique_files_referenced: Set[str]
+    models_used: Set[str]
 
 class QueryChatRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=2000, description="User's question")
-    chat_id: Optional[str] = Field(None, description="Existing chat ID, if continuing conversation")
-    chat_title: Optional[str] = Field(None, description="Optional title for new chat")
     model: Optional[str] = Field("gemini-1.5-flash", description="Model to use for response")
-    max_results: Optional[int] = Field(5, ge=1, le=20, description="Max number of source documents")
+    max_results: Optional[int] = Field(10, ge=1, le=20, description="Max number of source documents")
     temperature: Optional[float] = Field(0.7, ge=0.0, le=2.0, description="Response creativity level")
+
+class ModelsResponse(BaseModel):
+    available_models: Dict[str, List[str]]
+    default_model: str
+
+# ---------- Helper Functions ----------
+def extract_unique_files_from_sources(sources: Optional[List[SourceDocument]]) -> List[str]:
+    """Extract unique source files from sources."""
+    if not sources:
+        return []
+    return list(set(source.source_file for source in sources))
 
 # ---------- Routes ----------
 
-@router.get("/kbs-with-chats", response_model=List[KBWithChatsResponse])
-async def get_all_kbs_with_chats(
-    limit: int = Query(10, ge=1, le=50, description="Number of recent chats per KB"),
-    include_empty: bool = Query(True, description="Include KBs with no chats")
-):
+@router.get("/models", response_model=ModelsResponse)
+async def get_available_models():
+    """Get list of available models for chat."""
+    try:
+        chat_service = ChatService()
+        available_models = await chat_service.get_available_models()
+        
+        return ModelsResponse(
+            available_models=available_models,
+            default_model="gemini-1.5-flash"
+        )
+        
+    except Exception as e:
+        logger.error(f"Error fetching available models: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch available models"
+        )
+
+@router.get("/kbs-overview", response_model=List[KBWithRecentChatResponse])
+async def get_all_kbs_with_recent_chat():
     """
-    Get all knowledge bases with their recent chat data.
-    Useful for dashboard/overview pages.
+    Get all knowledge bases with their most recent chat message and metadata.
+    Includes processing status and other relevant information.
     """
     try:
         db = get_db()
         
-        # Get all KBs
+        # Get all KBs with their status
         kbs_cursor = db.kbs.find({}).sort("created_at", -1)
         results = []
         
         async for kb in kbs_cursor:
             kb_id = str(kb["_id"])
             
-            # Get chat count and recent chats for this KB
-            chat_count = await db.chats.count_documents({"kb_id": kb_id})
+            # Get total message count for this KB
+            total_messages = await db.chat_messages.count_documents({"kb_id": kb_id})
             
-            # Skip KBs with no chats if requested
-            if not include_empty and chat_count == 0:
-                continue
+            # Get most recent chat message
+            recent_message = None
+            recent_msg_doc = await db.chat_messages.find_one(
+                {"kb_id": kb_id},
+                sort=[("created_at", -1)]
+            )
             
-            recent_chats = []
-            if chat_count > 0:
-                chats_cursor = db.chats.find(
-                    {"kb_id": kb_id}
-                ).sort("last_updated", -1).limit(limit)
+            # Collect unique files and models used
+            unique_files = set()
+            models_used = set()
+            
+            if recent_msg_doc:
+                sources = None
+                unique_files_list = []
                 
-                async for chat in chats_cursor:
-                    # Get message count and last message preview
-                    message_count = len(chat.get("messages", []))
-                    last_message_preview = None
-                    
-                    if chat.get("messages"):
-                        last_msg = chat["messages"][-1]
-                        content = last_msg.get("content", "")
-                        last_message_preview = content[:100] + "..." if len(content) > 100 else content
-                    
-                    recent_chats.append(ChatResponse(
-                        chat_id=str(chat["_id"]),
-                        kb_id=kb_id,
-                        kb_name=kb["name"],
-                        title=chat.get("title"),
-                        created_at=chat["created_at"],
-                        last_updated=chat["last_updated"],
-                        message_count=message_count,
-                        last_message_preview=last_message_preview
-                    ))
+                if recent_msg_doc.get("sources"):
+                    sources = [SourceDocument(**source) for source in recent_msg_doc["sources"]]
+                    unique_files_list = extract_unique_files_from_sources(sources)
+                    unique_files.update(unique_files_list)
+                
+                if recent_msg_doc.get("model_used"):
+                    models_used.add(recent_msg_doc["model_used"])
+                
+                recent_message = ChatMessageResponse(
+                    message_id=str(recent_msg_doc["_id"]),
+                    created_at=recent_msg_doc["created_at"],
+                    message=recent_msg_doc["message"],
+                    by=recent_msg_doc["by"],
+                    model_used=recent_msg_doc.get("model_used"),
+                    sources=sources,
+                    unique_files_referenced=unique_files_list
+                )
             
-            results.append(KBWithChatsResponse(
+            # Get all unique files and models for this KB (for complete metadata)
+            all_messages_cursor = db.chat_messages.find(
+                {"kb_id": kb_id, "sources": {"$exists": True, "$ne": []}},
+                {"sources": 1, "model_used": 1}
+            )
+            
+            async for msg in all_messages_cursor:
+                if msg.get("sources"):
+                    for source in msg["sources"]:
+                        if source.get("source_file"):
+                            unique_files.add(source["source_file"])
+                if msg.get("model_used"):
+                    models_used.add(msg["model_used"])
+            
+            # Get processing info if available
+            processing_info = None
+            if kb.get("processing_stats"):
+                processing_info = {
+                    "total_files": kb["processing_stats"].get("total_files", 0),
+                    "processed_files": kb["processing_stats"].get("processed_files", 0),
+                    "failed_files": kb["processing_stats"].get("failed_files", 0),
+                    "total_chunks": kb["processing_stats"].get("total_chunks", 0)
+                }
+            
+            results.append(KBWithRecentChatResponse(
                 kb_id=kb_id,
                 kb_name=kb["name"],
                 kb_type=kb.get("kb_type", "generic"),
                 kb_description=kb.get("description"),
                 created_at=kb["created_at"],
-                chat_count=chat_count,
-                recent_chats=recent_chats
+                last_updated=kb.get("last_updated", kb["created_at"]),
+                status=kb.get("status", "unknown"),
+                processing_info=processing_info,
+                total_messages=total_messages,
+                recent_chat=recent_message,
+                unique_files_referenced=unique_files,
+                models_used=models_used
             ))
         
         return results
         
     except Exception as e:
-        logger.error(f"Error fetching KBs with chats: {e}")
+        logger.error(f"Error fetching KBs overview: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to fetch knowledge bases with chats"
+            detail="Failed to fetch knowledge bases overview"
         )
 
-@router.get("/{kb_id}/chats", response_model=List[ChatResponse])
-async def get_chats_for_kb(
+@router.get("/{kb_id}/chats", response_model=KBChatResponse)
+async def get_all_chats_for_kb(
     kb_id: str,
-    skip: int = Query(0, ge=0, description="Number of chats to skip"),
-    limit: int = Query(20, ge=1, le=100, description="Number of chats to return")
+    skip: int = Query(0, ge=0, description="Number of messages to skip"),
+    limit: int = Query(50, ge=1, le=200, description="Number of messages to return")
 ):
     """
-    Get all chats for a specific knowledge base with pagination.
+    Get all chat messages for a specific knowledge base with complete details.
+    No separate chat detail endpoint needed - everything is returned here.
     """
     try:
         db = get_db()
@@ -158,35 +204,50 @@ async def get_chats_for_kb(
                 detail="Knowledge Base not found"
             )
         
-        # Get chats for this KB
-        chats_cursor = db.chats.find(
-            {"kb_id": kb_id}
-        ).sort("last_updated", -1).skip(skip).limit(limit)
+        # Get total message count
+        total_messages = await db.chat_messages.count_documents({"kb_id": kb_id})
         
-        results = []
-        async for chat in chats_cursor:
-            # Calculate message count and preview
-            messages = chat.get("messages", [])
-            message_count = len(messages)
-            last_message_preview = None
+        # Get messages with pagination
+        messages_cursor = db.chat_messages.find(
+            {"kb_id": kb_id}
+        ).sort("created_at", -1).skip(skip).limit(limit)
+        
+        messages = []
+        unique_files = set()
+        models_used = set()
+        
+        async for msg_doc in messages_cursor:
+            sources = None
+            unique_files_list = []
             
-            if messages:
-                last_msg = messages[-1]
-                content = last_msg.get("content", "")
-                last_message_preview = content[:100] + "..." if len(content) > 100 else content
+            if msg_doc.get("sources"):
+                sources = [SourceDocument(**source) for source in msg_doc["sources"]]
+                unique_files_list = extract_unique_files_from_sources(sources)
+                unique_files.update(unique_files_list)
             
-            results.append(ChatResponse(
-                chat_id=str(chat["_id"]),
-                kb_id=kb_id,
-                kb_name=kb["name"],
-                title=chat.get("title"),
-                created_at=chat["created_at"],
-                last_updated=chat["last_updated"],
-                message_count=message_count,
-                last_message_preview=last_message_preview
+            if msg_doc.get("model_used"):
+                models_used.add(msg_doc["model_used"])
+            
+            messages.append(ChatMessageResponse(
+                message_id=str(msg_doc["_id"]),
+                created_at=msg_doc["created_at"],
+                message=msg_doc["message"],
+                by=msg_doc["by"],
+                model_used=msg_doc.get("model_used"),
+                sources=sources,
+                unique_files_referenced=unique_files_list
             ))
         
-        return results
+        # Reverse to get chronological order (oldest first)
+        messages.reverse()
+        
+        return KBChatResponse(
+            kb_id=kb_id,
+            messages=messages,
+            total_messages=total_messages,
+            unique_files_referenced=unique_files,
+            models_used=models_used
+        )
         
     except HTTPException:
         raise
@@ -197,69 +258,11 @@ async def get_chats_for_kb(
             detail="Failed to fetch chats for knowledge base"
         )
 
-@router.get("/{kb_id}/chats/{chat_id}", response_model=ChatDetailResponse)
-async def get_chat_detail(kb_id: str, chat_id: str):
-    """
-    Get detailed chat information with all messages for a specific chat.
-    """
-    try:
-        db = get_db()
-        
-        # Verify KB exists
-        kb = await db.kbs.find_one({"_id": ObjectId(kb_id)})
-        if not kb:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Knowledge Base not found"
-            )
-        
-        # Get chat
-        chat = await db.chats.find_one({
-            "_id": ObjectId(chat_id),
-            "kb_id": kb_id
-        })
-        if not chat:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Chat not found"
-            )
-        
-        # Convert messages to response format
-        messages = []
-        for msg in chat.get("messages", []):
-            messages.append(MessageResponse(
-                message_id=msg.get("message_id", str(uuid.uuid4())),
-                role=msg["role"],
-                content=msg["content"],
-                timestamp=msg["timestamp"],
-                model_used=msg.get("model_used"),
-                sources=msg.get("sources")
-            ))
-        
-        return ChatDetailResponse(
-            chat_id=str(chat["_id"]),
-            kb_id=kb_id,
-            kb_name=kb["name"],
-            title=chat.get("title"),
-            created_at=chat["created_at"],
-            last_updated=chat["last_updated"],
-            messages=messages
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching chat detail {chat_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to fetch chat details"
-        )
-
 @router.post("/{kb_id}/query", response_model=QueryResponse)
 async def query_knowledge_base(kb_id: str, request: QueryChatRequest):
     """
     Query a knowledge base and get an AI response with sources.
-    Can create a new chat or continue an existing one.
+    Uses the specified model for generating the response.
     """
     try:
         db = get_db()
@@ -287,8 +290,6 @@ async def query_knowledge_base(kb_id: str, request: QueryChatRequest):
             kb_id=kb_id,
             kb_name=kb["name"],
             query=request.query,
-            chat_id=request.chat_id,
-            chat_title=request.chat_title,
             model=request.model,
             max_results=request.max_results,
             temperature=request.temperature
@@ -306,10 +307,10 @@ async def query_knowledge_base(kb_id: str, request: QueryChatRequest):
             detail=f"Failed to process query: {str(e)}"
         )
 
-@router.delete("/{kb_id}/chats/{chat_id}")
-async def delete_chat(kb_id: str, chat_id: str):
+@router.delete("/{kb_id}/chats")
+async def delete_all_chats_for_kb(kb_id: str):
     """
-    Delete a specific chat and all its messages.
+    Delete all chat messages for a specific knowledge base.
     """
     try:
         db = get_db()
@@ -322,70 +323,56 @@ async def delete_chat(kb_id: str, chat_id: str):
                 detail="Knowledge Base not found"
             )
         
-        # Delete the chat
-        result = await db.chats.delete_one({
-            "_id": ObjectId(chat_id),
+        # Delete all chat messages for this KB
+        result = await db.chat_messages.delete_many({"kb_id": kb_id})
+        
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "message": f"Deleted {result.deleted_count} chat messages for KB {kb_id}",
+                "deleted_count": result.deleted_count
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting chats for KB {kb_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete chats"
+        )
+
+@router.delete("/{kb_id}/messages/{message_id}")
+async def delete_specific_message(kb_id: str, message_id: str):
+    """
+    Delete a specific chat message.
+    """
+    try:
+        db = get_db()
+        
+        # Delete the specific message
+        result = await db.chat_messages.delete_one({
+            "_id": ObjectId(message_id),
             "kb_id": kb_id
         })
         
         if result.deleted_count == 0:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="Chat not found"
+                detail="Message not found"
             )
         
         return JSONResponse(
             status_code=status.HTTP_200_OK,
-            content={"message": "Chat deleted successfully", "chat_id": chat_id}
+            content={"message": "Message deleted successfully", "message_id": message_id}
         )
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error deleting chat {chat_id}: {e}")
+        logger.error(f"Error deleting message {message_id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to delete chat"
-        )
-
-@router.patch("/{kb_id}/chats/{chat_id}/title")
-async def update_chat_title(kb_id: str, chat_id: str, title: str = Query(..., min_length=1, max_length=200)):
-    """
-    Update the title of a specific chat.
-    """
-    try:
-        db = get_db()
-        
-        # Update chat title
-        result = await db.chats.update_one(
-            {
-                "_id": ObjectId(chat_id),
-                "kb_id": kb_id
-            },
-            {
-                "$set": {
-                    "title": title.strip(),
-                    "last_updated": datetime.utcnow()
-                }
-            }
-        )
-        
-        if result.matched_count == 0:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Chat not found"
-            )
-        
-        return JSONResponse(
-            status_code=status.HTTP_200_OK,
-            content={"message": "Chat title updated successfully", "title": title.strip()}
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error updating chat title {chat_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to update chat title"
+            detail="Failed to delete message"
         )

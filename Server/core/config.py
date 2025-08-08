@@ -48,8 +48,8 @@ class Settings(BaseSettings):
         default=os.getenv("GEMINI_API_KEY"),
         description="Google Gemini API key for embeddings"
     )
-    CLAUDE_API_KEY: str = Field(
-        default=os.getenv("CLAUDE_API_KEY"),
+    ANTHROPIC_API_KEY: str = Field(
+        default=os.getenv("ANTHROPIC_API_KEY"),
         description="Anthropic Claude API key for chat"
     )
     GEMINI_EMBED_MODEL: str = Field(
