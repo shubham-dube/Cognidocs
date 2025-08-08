@@ -1,7 +1,3 @@
-# Include routers
-# app.include_router(chat.router, prefix="api/v1/chat", tags=["Chat APIs"])
-
-# main.py
 import logging
 import asyncio
 from contextlib import asynccontextmanager
@@ -16,6 +12,8 @@ import uuid
 from core.config import settings
 from core.db import connect_to_mongo, close_mongo_connection, check_database_health, get_db_stats
 from api.knowledge_bases import router as kb_router
+from api.chats import router as chat_router
+from api.vector_search import router as vector_router
 
 # Setup logging
 logging.basicConfig(
@@ -241,6 +239,20 @@ app.include_router(
     kb_router,
     prefix=f"/api/v1/knowledge-bases",
     tags=["Knowledge Bases"]
+)
+
+app.include_router(
+    chat_router,
+    prefix="/api/v1/chats",
+    tags=["Chats"],
+    responses={404: {"description": "Not found"}}
+)
+
+app.include_router(
+    vector_router,
+    prefix="/api/v1/search",
+    tags=["Vector Search"],
+    responses={404: {"description": "Not found"}}
 )
 
 # Root endpoint
